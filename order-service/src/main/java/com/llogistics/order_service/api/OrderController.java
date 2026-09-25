@@ -2,83 +2,59 @@ package com.llogistics.order_service.api;
 
 import com.llogistics.order_service.order.OrderApplicationService;
 import com.llogistics.order_service.order.OrderEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import com.llogistics.order_service.workflow.OrderWorkflow;
-import io.temporal.api.enums.v1.WorkflowIdReusePolicy;
-import io.temporal.client.WorkflowClient;
-import io.temporal.client.WorkflowExecutionAlreadyStarted;
-import io.temporal.client.WorkflowOptions;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.server.ResponseStatusException;
 
-import jakarta.validation.constraints.Min;
+import java.net.URI;
 
 @RestController
 @RequestMapping("/orders")
 public class OrderController {
-    private final WorkflowClient workflowClient;
+
     private final OrderApplicationService orderApplicationService;
 
     public OrderController(
-            WorkflowClient workflowClient,
             OrderApplicationService orderApplicationService) {
-        this.workflowClient = workflowClient;
         this.orderApplicationService = orderApplicationService;
     }
 
     @PostMapping
     public ResponseEntity<OrderAccepted> create(
             @Valid @RequestBody CreateOrderRequest request) {
-        String workflowId = "order-" + request.orderId();
 
-        WorkflowOptions options = WorkflowOptions.newBuilder()
-                .setWorkflowId(workflowId)
-                .setTaskQueue("order-fulfillment")
-                .setWorkflowIdReusePolicy(
-                        WorkflowIdReusePolicy
-                                .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
-                )
-                .build();
-        OrderWorkflow workflow = workflowClient.newWorkflowStub(
-                OrderWorkflow.class,
-                options
-        );
-        try {
-            WorkflowClient.start(workflow::process, request.orderId());
-        } catch (WorkflowExecutionAlreadyStarted exception) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "This order already has a workflow",
-                    exception
-            );
-        }
-
-        return ResponseEntity.accepted().body(
-                new OrderAccepted(
-                        request.orderId(),
-                        workflowId,
-                        "ACCEPTED"
-                )
+        OrderEntity order = orderApplicationService.createOrder(
+                request.orderId(),
+                request.sku(),
+                request.quantity(),
+                request.shippingAddress()
         );
 
+        return ResponseEntity.accepted()
+                .location(URI.create("/orders/" + order.getOrderId()))
+                .body(new OrderAccepted(
+                        order.getOrderId(),
+                        order.getWorkflowId(),
+                        order.getStatus().name()
+                ));
     }
 
     @GetMapping("/{orderId}")
     public ResponseEntity<OrderEntity> getOrder(
-            @PathVariable("orderId") String orderId ) {
-        OrderEntity order = orderApplicationService.getOrder(orderId);
-        return ResponseEntity.ok(order);
+            @PathVariable("orderId") String orderId) {
+        return ResponseEntity.ok(
+                orderApplicationService.getOrder(orderId)
+        );
     }
 
     public record CreateOrderRequest(
@@ -90,7 +66,7 @@ public class OrderController {
             String orderId,
 
             @NotBlank
-            @Size(max=64)
+            @Size(max = 64)
             String sku,
 
             @NotNull
@@ -98,7 +74,7 @@ public class OrderController {
             Integer quantity,
 
             @NotBlank
-            @Size(max=500)
+            @Size(max = 500)
             String shippingAddress
     ) {
     }
