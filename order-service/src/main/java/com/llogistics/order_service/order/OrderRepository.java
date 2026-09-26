@@ -1,11 +1,18 @@
 package com.llogistics.order_service.order;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import jakarta.persistence.LockModeType;
+import java.util.Optional;
 
 public interface OrderRepository extends JpaRepository<OrderEntity, String> {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select o from OrderEntity o where o.orderId = :orderId")
+    Optional<OrderEntity> findByIdForUpdate(@Param("orderId") String orderId);
+
     @Modifying
     @Query(value = """
             INSERT INTO orders (

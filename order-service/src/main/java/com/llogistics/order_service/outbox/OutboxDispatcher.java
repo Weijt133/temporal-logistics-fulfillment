@@ -1,6 +1,6 @@
 package com.llogistics.order_service.outbox;
 
-import com.llogistics.order_service.workflow.OrderWorkflow;
+import com.llogistics.order_service.workflow.OrderFulfillmentWorkflow;
 import io.temporal.api.enums.v1.WorkflowIdReusePolicy;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowExecutionAlreadyStarted;
@@ -62,15 +62,15 @@ public class OutboxDispatcher {
     private void startWorkflow(OutboxRepository.PendingStart task) {
         WorkflowOptions options = WorkflowOptions.newBuilder()
                 .setWorkflowId(task.workflowId())
-                .setTaskQueue("order-fulfillment")
+                .setTaskQueue(OrderFulfillmentWorkflow.TASK_QUEUE)
                 .setWorkflowIdReusePolicy(
                         WorkflowIdReusePolicy
                                 .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
                 )
                 .build();
 
-        OrderWorkflow workflow = workflowClient.newWorkflowStub(
-                OrderWorkflow.class,
+        OrderFulfillmentWorkflow workflow = workflowClient.newWorkflowStub(
+                OrderFulfillmentWorkflow.class,
                 options
         );
 
