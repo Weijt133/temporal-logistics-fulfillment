@@ -1,5 +1,7 @@
 # 订单自动预留库存
 
+> 这是此前库存阶段的说明。Shipment 已接入，新订单现在继续创建运单并进入 `SHIPMENT_CREATED`；当前运行与测试步骤见 [Shipment 说明](shipment-workflow.md)。历史库存阶段订单仍保持原状态。
+
 本阶段实现：创建订单 → Outbox → Temporal → 库存预留 → 订单 `RESERVED`。
 
 ## 实际调用顺序

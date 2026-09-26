@@ -2,10 +2,14 @@ package com.llogistics.order_service;
 
 import com.llogistics.order_service.activity.OrderFulfillmentActivities;
 import com.llogistics.order_service.activity.OrderFulfillmentActivitiesImpl;
+import com.llogistics.order_service.activity.ShipmentActivities;
+import com.llogistics.order_service.activity.ShipmentActivitiesImpl;
 import com.llogistics.order_service.inventory.InventoryService;
 import com.llogistics.order_service.order.OrderApplicationService;
 import com.llogistics.order_service.order.OrderFulfillmentService;
 import com.llogistics.order_service.order.OrderStatus;
+import com.llogistics.order_service.shipment.ShipmentService;
+import com.llogistics.order_service.shipment.ShipmentStatus;
 import com.llogistics.order_service.outbox.OutboxDispatcher;
 import com.llogistics.order_service.outbox.OutboxRepository;
 import com.llogistics.order_service.workflow.OrderFulfillmentWorkflow;
@@ -14,6 +18,7 @@ import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowFailedException;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.testing.TestWorkflowEnvironment;
+import io.temporal.testing.WorkflowReplayer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,13 +29,21 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.mock.env.MockEnvironment;
+import org.springframework.web.server.ResponseStatusException;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest(properties = "spring.temporal.test-server.enabled=true")
+@ActiveProfiles("demo")
 @Timeout(30)
 class OrderFulfillmentIntegrationTests {
     // Real PostgreSQL semantics, isolated from the developer's public tables and stock.
@@ -50,6 +63,8 @@ class OrderFulfillmentIntegrationTests {
     @Autowired OrderApplicationService orders;
     @Autowired OrderFulfillmentService fulfillment;
     @Autowired OrderFulfillmentActivitiesImpl activities;
+    @Autowired ShipmentActivitiesImpl shipmentActivities;
+    @Autowired ShipmentService shipments;
     @Autowired InventoryService inventory;
     @Autowired OutboxRepository outbox;
     @Autowired WorkflowClient workflowClient;
@@ -67,6 +82,7 @@ class OrderFulfillmentIntegrationTests {
 
     @AfterEach
     void removeOwnRows() {
+        jdbc.update("DELETE FROM shipments WHERE order_id = ?", orderId);
         jdbc.update("DELETE FROM workflow_start_outbox WHERE order_id = ?", orderId);
         jdbc.update("DELETE FROM inventory_reservations WHERE order_id = ?", orderId);
         jdbc.update("DELETE FROM orders WHERE order_id = ?", orderId);
@@ -82,17 +98,21 @@ class OrderFulfillmentIntegrationTests {
     }
 
     @Test
-    void outboxStartsWorkflowAndReservesOrder() throws Exception {
+    void outboxStartsWorkflowAndCreatesShipment() throws Exception {
         orders.createOrder(orderId, sku, 2, "Sydney test address");
         new OutboxDispatcher(outbox, workflowClient).dispatchPending();
 
-        assertEquals("RESERVED", result());
-        assertEquals(OrderStatus.RESERVED, orders.getOrder(orderId).getStatus());
+        assertEquals("SHIPMENT_CREATED", result());
+        assertEquals(OrderStatus.SHIPMENT_CREATED, orders.getOrder(orderId).getStatus());
+        assertEquals(ShipmentStatus.CREATED, shipments.getByOrderId(orderId).getStatus());
+        assertEquals(shipments.getByOrderId(orderId).getShipmentId(), orders.getOrder(orderId).getShipmentId());
         assertNull(orders.getOrder(orderId).getFailureReason());
         assertEquals(3, inventory.getStock(sku).availableQuantity());
         assertEquals("RESERVED", inventory.getReservation(orderId).status());
         assertEquals("DISPATCHED", jdbc.queryForObject(
                 "SELECT status FROM workflow_start_outbox WHERE order_id = ?", String.class, orderId));
+        WorkflowReplayer.replayWorkflowExecution(workflowClient.fetchHistory("order-" + orderId),
+                OrderFulfillmentWorkflowImpl.class);
     }
 
     @Test
@@ -154,6 +174,7 @@ class OrderFulfillmentIntegrationTests {
         try (TestWorkflowEnvironment environment = TestWorkflowEnvironment.newInstance()) {
             var worker = environment.newWorker(OrderFulfillmentWorkflow.TASK_QUEUE);
             worker.registerWorkflowImplementationTypes(OrderFulfillmentWorkflowImpl.class);
+            worker.registerActivitiesImplementations(shipmentActivities);
             worker.registerActivitiesImplementations(new OrderFulfillmentActivities() {
                 @Override
                 public String reserveOrderInventory(String id) {
@@ -174,12 +195,227 @@ class OrderFulfillmentIntegrationTests {
                     WorkflowOptions.newBuilder().setWorkflowId("retry-" + orderId)
                             .setTaskQueue(OrderFulfillmentWorkflow.TASK_QUEUE).build());
 
-            assertEquals("RESERVED", workflow.process(orderId));
+            assertEquals("SHIPMENT_CREATED", workflow.process(orderId));
         }
         assertEquals(2, attempts.get());
         assertEquals(3, inventory.getStock(sku).availableQuantity());
         assertEquals(1, reservationCount());
-        assertEquals(OrderStatus.RESERVED, orders.getOrder(orderId).getStatus());
+        assertEquals(OrderStatus.SHIPMENT_CREATED, orders.getOrder(orderId).getStatus());
+    }
+
+    @Test
+    void concurrentShipmentRequestsReturnOneIdAndLateOutboxDoesNotRegressStatus() throws Exception {
+        reserveOrder();
+        CountDownLatch ready = new CountDownLatch(8);
+        CountDownLatch start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(8)) {
+            var jobs = new ArrayList<java.util.concurrent.Future<String>>();
+            for (int i = 0; i < 8; i++) {
+                jobs.add(executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(5, TimeUnit.SECONDS)) { throw new IllegalStateException("Test barrier timed out"); }
+                    return shipments.createForOrder(orderId);
+                }));
+            }
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            start.countDown();
+            var ids = new HashSet<String>();
+            for (var job : jobs) { ids.add(job.get(10, TimeUnit.SECONDS)); }
+            assertEquals(1, ids.size());
+        }
+        outbox.markDispatched(orderId);
+        assertEquals(1, shipmentCount());
+        assertEquals(OrderStatus.SHIPMENT_CREATED, orders.getOrder(orderId).getStatus());
+        assertEquals(3, inventory.getStock(sku).availableQuantity());
+    }
+
+    @Test
+    void shipmentAndOrderUpdateRollBackTogether() {
+        reserveOrder();
+        jdbc.execute("ALTER TABLE orders ADD CONSTRAINT reject_shipment_for_test CHECK (status <> 'SHIPMENT_CREATED')");
+        try {
+            assertThrows(org.springframework.dao.DataIntegrityViolationException.class,
+                    () -> shipments.createForOrder(orderId));
+            assertEquals(0, shipmentCount());
+            assertNull(orders.getOrder(orderId).getShipmentId());
+            assertEquals(OrderStatus.RESERVED, orders.getOrder(orderId).getStatus());
+        } finally {
+            jdbc.execute("ALTER TABLE orders DROP CONSTRAINT reject_shipment_for_test");
+        }
+    }
+
+    @Test
+    void transientCarrierFailureRetriesTwiceThenCreatesOneShipment() throws Exception {
+        orderId = "demo-retry-" + UUID.randomUUID();
+        startOrder();
+        assertEquals("SHIPMENT_CREATED", result());
+        assertEquals(3, maximumActivityAttempt());
+        assertEquals(1, shipmentCount());
+        assertEquals(3, inventory.getStock(sku).availableQuantity());
+    }
+
+    @Test
+    void permanentRejectionCompensatesWithoutCreatingShipment() {
+        orderId = "demo-reject-" + UUID.randomUUID();
+        startOrder();
+        assertThrows(WorkflowFailedException.class, this::result);
+        assertEquals(1, maximumActivityAttempt());
+        assertEquals(OrderStatus.FAILED, orders.getOrder(orderId).getStatus());
+        assertTrue(orders.getOrder(orderId).getFailureReason().contains("carrier rejection"));
+        assertEquals("RELEASED", inventory.getReservation(orderId).status());
+        assertEquals(5, inventory.getStock(sku).availableQuantity());
+        assertEquals(0, shipmentCount());
+    }
+
+    @Test
+    void exhaustedLostResponsesCancelCommittedShipmentAndRestoreStock() throws Exception {
+        orderId = "demo-ambiguous-" + UUID.randomUUID();
+        startOrder();
+        assertThrows(WorkflowFailedException.class, this::result);
+        assertEquals(3, maximumActivityAttempt());
+        assertEquals(1, shipmentCount());
+        assertEquals(ShipmentStatus.CANCELLED, shipments.getByOrderId(orderId).getStatus());
+        assertEquals(OrderStatus.FAILED, orders.getOrder(orderId).getStatus());
+        assertEquals("RELEASED", inventory.getReservation(orderId).status());
+        assertEquals(5, inventory.getStock(sku).availableQuantity());
+        WorkflowReplayer.replayWorkflowExecution(workflowClient.fetchHistory("order-" + orderId),
+                OrderFulfillmentWorkflowImpl.class);
+    }
+
+    @Test
+    void repeatedCompensationAndLateCreationCannotRestoreOrDeductStockAgain() {
+        reserveOrder();
+        shipments.createForOrder(orderId);
+        shipments.beginCompensation(orderId, "Test failure");
+        assertThrows(ResponseStatusException.class, () -> shipments.createForOrder(orderId));
+        shipments.compensateFailure(orderId, "Test failure");
+        shipments.beginCompensation(orderId, "Test failure");
+        shipments.compensateFailure(orderId, "Test failure");
+        assertThrows(ResponseStatusException.class, () -> shipments.createForOrder(orderId));
+        assertEquals(5, inventory.getStock(sku).availableQuantity());
+        assertEquals(ShipmentStatus.CANCELLED, shipments.getByOrderId(orderId).getStatus());
+        assertEquals(1, shipmentCount());
+    }
+
+    @Test
+    void failedCompensationRollsBackAndCanResume() {
+        reserveOrder();
+        shipments.createForOrder(orderId);
+        shipments.beginCompensation(orderId, "Test failure");
+        jdbc.execute("ALTER TABLE orders ADD CONSTRAINT reject_failed_for_test CHECK (status <> 'FAILED')");
+        try {
+            assertThrows(org.springframework.dao.DataIntegrityViolationException.class,
+                    () -> shipments.compensateFailure(orderId, "Test failure"));
+            assertEquals(OrderStatus.COMPENSATING, orders.getOrder(orderId).getStatus());
+            assertEquals(ShipmentStatus.CREATED, shipments.getByOrderId(orderId).getStatus());
+            assertEquals("RESERVED", inventory.getReservation(orderId).status());
+            assertEquals(3, inventory.getStock(sku).availableQuantity());
+        } finally {
+            jdbc.execute("ALTER TABLE orders DROP CONSTRAINT reject_failed_for_test");
+        }
+        shipments.compensateFailure(orderId, "Test failure");
+        assertEquals(OrderStatus.FAILED, orders.getOrder(orderId).getStatus());
+        assertEquals(5, inventory.getStock(sku).availableQuantity());
+        assertEquals(ShipmentStatus.CANCELLED, shipments.getByOrderId(orderId).getStatus());
+    }
+
+    @Test
+    void faultSimulationIsDisabledOutsideDemoProfile() {
+        orderId = "demo-reject-" + UUID.randomUUID();
+        reserveOrder();
+        var normalActivities = new ShipmentActivitiesImpl(shipments, new MockEnvironment());
+        assertNotNull(normalActivities.createOrderShipment(orderId));
+        assertEquals(OrderStatus.SHIPMENT_CREATED, orders.getOrder(orderId).getStatus());
+    }
+
+    @Test
+    void compensationActivityRetriesBeforeWorkflowReportsFailure() {
+        orderId = "demo-reject-" + UUID.randomUUID();
+        orders.createOrder(orderId, sku, 2, "Sydney test address");
+        AtomicInteger attempts = new AtomicInteger();
+        try (TestWorkflowEnvironment environment = TestWorkflowEnvironment.newInstance()) {
+            var worker = environment.newWorker(OrderFulfillmentWorkflow.TASK_QUEUE);
+            worker.registerWorkflowImplementationTypes(OrderFulfillmentWorkflowImpl.class);
+            worker.registerActivitiesImplementations(activities, new ShipmentActivities() {
+                @Override public String createOrderShipment(String id) {
+                    return shipmentActivities.createOrderShipment(id);
+                }
+                @Override public void beginShipmentCompensation(String id, String reason) {
+                    shipmentActivities.beginShipmentCompensation(id, reason);
+                }
+                @Override public void compensateShipmentFailure(String id, String reason) {
+                    if (attempts.incrementAndGet() == 1) {
+                        assertEquals(OrderStatus.COMPENSATING, orders.getOrder(id).getStatus());
+                        throw new IllegalStateException("Simulated temporary compensation outage");
+                    }
+                    shipmentActivities.compensateShipmentFailure(id, reason);
+                }
+            });
+            environment.start();
+            var workflow = environment.getWorkflowClient().newWorkflowStub(OrderFulfillmentWorkflow.class,
+                    WorkflowOptions.newBuilder().setWorkflowId("compensation-" + orderId)
+                            .setTaskQueue(OrderFulfillmentWorkflow.TASK_QUEUE).build());
+            assertThrows(WorkflowFailedException.class, () -> workflow.process(orderId));
+        }
+        assertEquals(2, attempts.get());
+        assertEquals(OrderStatus.FAILED, orders.getOrder(orderId).getStatus());
+        assertEquals(5, inventory.getStock(sku).availableQuantity());
+    }
+
+    @Test
+    void shipmentResponseLostOnceRecoversWithOriginalShipment() {
+        orders.createOrder(orderId, sku, 2, "Sydney test address");
+        AtomicInteger attempts = new AtomicInteger();
+        var ids = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        try (TestWorkflowEnvironment environment = TestWorkflowEnvironment.newInstance()) {
+            var worker = environment.newWorker(OrderFulfillmentWorkflow.TASK_QUEUE);
+            worker.registerWorkflowImplementationTypes(OrderFulfillmentWorkflowImpl.class);
+            worker.registerActivitiesImplementations(activities, new ShipmentActivities() {
+                @Override public String createOrderShipment(String id) {
+                    String shipmentId = shipmentActivities.createOrderShipment(id);
+                    ids.add(shipmentId);
+                    if (attempts.incrementAndGet() == 1) {
+                        throw new IllegalStateException("Simulated response lost after commit");
+                    }
+                    return shipmentId;
+                }
+                @Override public void beginShipmentCompensation(String id, String reason) {
+                    shipmentActivities.beginShipmentCompensation(id, reason);
+                }
+                @Override public void compensateShipmentFailure(String id, String reason) {
+                    shipmentActivities.compensateShipmentFailure(id, reason);
+                }
+            });
+            environment.start();
+            var workflow = environment.getWorkflowClient().newWorkflowStub(OrderFulfillmentWorkflow.class,
+                    WorkflowOptions.newBuilder().setWorkflowId("shipment-retry-" + orderId)
+                            .setTaskQueue(OrderFulfillmentWorkflow.TASK_QUEUE).build());
+            assertEquals("SHIPMENT_CREATED", workflow.process(orderId));
+        }
+        assertEquals(2, attempts.get());
+        assertEquals(1, ids.size());
+        assertEquals(1, shipmentCount());
+        assertEquals(3, inventory.getStock(sku).availableQuantity());
+    }
+
+    private void reserveOrder() {
+        orders.createOrder(orderId, sku, 2, "Sydney test address");
+        fulfillment.reserveInventory(orderId);
+    }
+
+    private void startOrder() {
+        orders.createOrder(orderId, sku, 2, "Sydney test address");
+        new OutboxDispatcher(outbox, workflowClient).dispatchPending();
+    }
+
+    private int shipmentCount() {
+        return jdbc.queryForObject("SELECT count(*) FROM shipments WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    private int maximumActivityAttempt() {
+        return workflowClient.fetchHistory("order-" + orderId).getEvents().stream()
+                .filter(event -> event.hasActivityTaskStartedEventAttributes())
+                .mapToInt(event -> event.getActivityTaskStartedEventAttributes().getAttempt()).max().orElse(0);
     }
 
     private String result() throws Exception {
