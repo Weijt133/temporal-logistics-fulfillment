@@ -1,0 +1,6 @@
+config.json
+.env
+*.dump
+*.db
+*.tgz
+__pycache__/

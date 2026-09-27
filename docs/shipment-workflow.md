@@ -27,3 +27,5 @@ From the repository root, with the backend running in demo mode:
 ```
 
 Run scenarios one at a time. Success consumes stock; compensated failures restore it. Scripts retain their test records.
+
+These commands use the original development Compose Temporal container. For the separate deployment stack, use its console or `deploy/smoke.py`. See the [demo guide](demo-guide.md) for a reviewer walkthrough, [architecture](architecture.md#ambiguous-outcome-scenario) for the lost-response sequence, and [testing](testing.md) for coverage and limitations.

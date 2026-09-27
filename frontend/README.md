@@ -2,6 +2,8 @@
 
 React, TypeScript, Vite, and ESLint. All application labels, help text, and errors are in English.
 
+Use Node.js 22 to match CI and the container build. Run the following commands from `frontend/`; for backend and infrastructure startup, follow the [root quick start](../README.md#quick-start-development).
+
 ```powershell
 npm ci
 npm run dev
@@ -36,3 +38,5 @@ Polling is sequential, bounded by request timeouts, and cancelled on unmount or 
 5. Reserve twice, release twice, then verify that a late reserve is rejected.
 6. Look up a shipment and an unknown order/SKU; verify useful English messages.
 7. Resize to a narrow viewport and check navigation, forms, and detail panels.
+
+These are manual checks. Lint and build do not run browser interaction tests. See [testing](../docs/testing.md), the [API reference](../docs/api.md), and the [reviewer demo guide](../docs/demo-guide.md) for the full project context.

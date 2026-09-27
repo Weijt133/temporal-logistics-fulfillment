@@ -9,4 +9,6 @@ Orders and workflow-start outbox entries are saved in one transaction. Temporal 
 - Outbox `DISPATCHED` means the workflow was started, not that fulfillment finished.
 - Older inventory-only workflow histories remain replay-compatible.
 
-See [the project README](../README.md) for startup and verification commands.
+The REST inventory lab uses independent IDs. Do not directly reserve/release inventory for an order owned by the fulfillment workflow: those endpoints do not coordinate order or shipment state.
+
+See [the project README](../README.md) for startup commands, [architecture](architecture.md#transactions-and-idempotency) for transaction boundaries, [API reference](api.md#inventory) for request semantics, and [testing](testing.md) for verification evidence.

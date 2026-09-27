@@ -1,0 +1,7 @@
+{
+  "DOMAIN": "demo.example.com",
+  "TEMPORAL_DOMAIN": "temporal.demo.example.com",
+  "DEMO_USERNAME": "reviewer",
+  "DEMO_PASSWORD_HASH": "REPLACE_WITH_CADDY_BCRYPT_HASH",
+  "DB_PASSWORD": "REPLACE_WITH_A_LONG_RANDOM_PASSWORD"
+}

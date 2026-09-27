@@ -1,0 +1,111 @@
+name: logistics-demo
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: logistics
+      POSTGRES_DB: logistics
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logistics -d logistics"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+
+  temporal-data-init:
+    image: alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+    user: "0:0"
+    command: ["chown", "1000:1000", "/data"]
+    volumes:
+      - temporal-data:/data
+
+  temporal:
+    image: temporalio/temporal@sha256:ad4c82c97bd12b417d1ea942610dbcd511afb250c4d5ed26c694009533df447e
+    # A private development server for this portfolio demo, not production HA.
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/data/temporal.db", "--ui-disable-news-fetch"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18233:8233"
+    depends_on:
+      temporal-data-init:
+        condition: service_completed_successfully
+    volumes:
+      - temporal-data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+    logging: *logging
+
+  order-service:
+    image: ${ORDER_IMAGE:-logistics/order-service:local}
+    restart: unless-stopped
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_SHUTDOWN: graceful
+      SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 30s
+      SPRING_PROFILES_ACTIVE: demo
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/logistics
+      SPRING_DATASOURCE_USERNAME: logistics
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      SPRING_TEMPORAL_CONNECTION_TARGET: temporal:7233
+      APP_TEMPORAL_UI_BASE_URL: ${TEMPORAL_UI_URL:-http://localhost:18233}
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=65.0
+    mem_limit: 1536m
+    stop_grace_period: 45s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    logging: *logging
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-logistics/frontend:local}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18080:80"
+    depends_on:
+      order-service:
+        condition: service_healthy
+    logging: *logging
+
+  gateway:
+    image: caddy:2-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    profiles: [public]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      TEMPORAL_DOMAIN: ${TEMPORAL_DOMAIN:-temporal.localhost}
+      DEMO_USERNAME: ${DEMO_USERNAME:-reviewer}
+      DEMO_PASSWORD_HASH: ${DEMO_PASSWORD_HASH:-unused}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+    logging: *logging
+
+volumes:
+  postgres-data:
+  temporal-data:
+  caddy-data:
+  caddy-config:

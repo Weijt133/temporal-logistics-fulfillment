@@ -1,0 +1,14 @@
+{$DOMAIN} {
+    basic_auth {
+        {$DEMO_USERNAME} {$DEMO_PASSWORD_HASH}
+    }
+    encode zstd gzip
+    reverse_proxy frontend:80
+}
+
+{$TEMPORAL_DOMAIN} {
+    basic_auth {
+        {$DEMO_USERNAME} {$DEMO_PASSWORD_HASH}
+    }
+    reverse_proxy temporal:8233
+}

@@ -1,0 +1,66 @@
+name: Deploy demo to AWS
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: logistics-demo-deploy
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  publish-and-deploy:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: demo
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ORDER_REPOSITORY_URI: ${{ vars.ORDER_REPOSITORY_URI }}
+      FRONTEND_REPOSITORY_URI: ${{ vars.FRONTEND_REPOSITORY_URI }}
+      RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+      INSTANCE_ID: ${{ vars.INSTANCE_ID }}
+      CONFIG_PARAMETER: ${{ vars.CONFIG_PARAMETER }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Build and publish immutable application images
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ORDER_REPOSITORY_URI:?}" "${FRONTEND_REPOSITORY_URI:?}"
+          registry="${ORDER_REPOSITORY_URI%%/*}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
+          publish() {
+            local uri="$1" context="$2"
+            if aws ecr describe-images --repository-name "${uri#*/}" --image-ids "imageTag=$GITHUB_SHA" >/dev/null 2>&1; then
+              echo "Reusing the immutable image for $GITHUB_SHA"
+            else
+              docker build --platform linux/amd64 -t "$uri:$GITHUB_SHA" "$context"
+              docker push "$uri:$GITHUB_SHA"
+            fi
+          }
+          publish "$ORDER_REPOSITORY_URI" order-service
+          publish "$FRONTEND_REPOSITORY_URI" frontend
+      - name: Upload release configuration and deploy through SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Archive only tracked files, so local secrets can never enter a release.
+          git archive --format=tar.gz --output="release/$GITHUB_SHA.tgz" HEAD deploy
+          aws s3 cp "release/$GITHUB_SHA.tgz" "s3://$RELEASE_BUCKET/releases/$GITHUB_SHA.tgz" --only-show-errors
+          RELEASE_CHECKSUM="$(sha256sum "release/$GITHUB_SHA.tgz" | cut -d ' ' -f 1)"
+          export RELEASE_CHECKSUM
+          python3 deploy/dispatch.py
