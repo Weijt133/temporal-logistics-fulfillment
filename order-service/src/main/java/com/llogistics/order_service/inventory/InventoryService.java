@@ -26,12 +26,12 @@ public class InventoryService {
                 orderId, sku, quantity
         );
 
-        // 同一个订单已经预留成功，直接返回原结果
+        // Return the existing reservation without deducting stock again.
         if ("RESERVED".equals(reservation.status())) {
             return reservation;
         }
 
-        // 已释放的订单不能被迟到的请求重新预留
+        // A late request must not reserve stock after release.
         if ("RELEASED".equals(reservation.status())) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
@@ -69,12 +69,12 @@ public class InventoryService {
                 orderId, sku, quantity
         );
 
-        // 已释放过，直接返回，不能再次增加库存
+        // Repeated releases must not increase stock again.
         if ("RELEASED".equals(reservation.status())) {
             return reservation;
         }
 
-        // 只有真正扣过库存，才需要加回
+        // Restore stock only when it was previously deducted.
         if ("RESERVED".equals(reservation.status())) {
             int updatedRows = inventoryRepository.increaseStock(
                     sku, quantity
@@ -87,7 +87,7 @@ public class InventoryService {
             }
         }
 
-        // PENDING 状态可以直接转为 RELEASED，不增加库存
+        // A pending reservation can be released without restoring stock.
         inventoryRepository.updateReservationStatus(
                 orderId, "RELEASED"
         );

@@ -8,6 +8,22 @@ import org.springframework.web.server.ResponseStatusException;
 
 @Service
 public class OrderApplicationService {
+    @Transactional(readOnly = true)
+    public OrderPage listOrders(int page, int size, OrderStatus status) {
+        if (page < 0 || size < 1 || size > 100) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Page must be non-negative and size must be between 1 and 100");
+        }
+        var pageable = org.springframework.data.domain.PageRequest.of(page, size,
+                org.springframework.data.domain.Sort.by("createdAt", "orderId").descending());
+        var result = status == null ? orderRepository.findAll(pageable)
+                : orderRepository.findByStatus(status, pageable);
+        return new OrderPage(result.getContent(), page, size,
+                result.getTotalElements(), result.getTotalPages());
+    }
+
+    public record OrderPage(java.util.List<OrderEntity> items, int page, int size,
+                            long totalElements, int totalPages) { }
     private final OrderRepository orderRepository;
     private final OutboxRepository outboxRepository;
 

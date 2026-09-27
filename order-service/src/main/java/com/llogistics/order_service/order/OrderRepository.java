@@ -9,6 +9,8 @@ import jakarta.persistence.LockModeType;
 import java.util.Optional;
 
 public interface OrderRepository extends JpaRepository<OrderEntity, String> {
+    org.springframework.data.domain.Page<OrderEntity> findByStatus(
+            OrderStatus status, org.springframework.data.domain.Pageable pageable);
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select o from OrderEntity o where o.orderId = :orderId")
     Optional<OrderEntity> findByIdForUpdate(@Param("orderId") String orderId);

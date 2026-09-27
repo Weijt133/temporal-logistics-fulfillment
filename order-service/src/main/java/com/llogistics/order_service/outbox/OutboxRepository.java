@@ -10,6 +10,14 @@ import java.util.List;
 
 @Repository
 public class OutboxRepository {
+    public java.util.Optional<DispatchStatus> findStatus(String orderId) {
+        return jdbcTemplate.query("""
+                SELECT status, attempts, last_error FROM workflow_start_outbox WHERE order_id = ?
+                """, (rs, row) -> new DispatchStatus(rs.getString("status"),
+                rs.getInt("attempts"), rs.getString("last_error")), orderId).stream().findFirst();
+    }
+
+    public record DispatchStatus(String status, int attempts, String lastError) { }
     private final JdbcTemplate jdbcTemplate;
     public OutboxRepository(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = jdbcTemplate;

@@ -69,6 +69,9 @@ class OrderFulfillmentIntegrationTests {
     @Autowired OutboxRepository outbox;
     @Autowired WorkflowClient workflowClient;
     @Autowired JdbcTemplate jdbc;
+    @Autowired com.llogistics.order_service.api.OrderController orderController;
+    @Autowired com.llogistics.order_service.api.OrderExecutionController executionController;
+    @Autowired com.llogistics.order_service.api.AppConfigController configController;
 
     private String orderId;
     private String sku;
@@ -401,6 +404,88 @@ class OrderFulfillmentIntegrationTests {
     private void reserveOrder() {
         orders.createOrder(orderId, sku, 2, "Sydney test address");
         fulfillment.reserveInventory(orderId);
+    }
+
+    private org.springframework.test.web.servlet.MockMvc console() {
+        return org.springframework.test.web.servlet.setup.MockMvcBuilders
+                .standaloneSetup(orderController, executionController, configController)
+                .setControllerAdvice(new com.llogistics.order_service.api.ApiExceptionHandler()).build();
+    }
+
+    @Test
+    void consoleListsOrdersAndReadsRealCompletedExecution() throws Exception {
+        startOrder();
+        assertEquals("SHIPMENT_CREATED", result());
+        var mvc = console();
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders")
+                        .param("status", "SHIPMENT_CREATED").param("size", "1"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.items[0].orderId").value(orderId))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.totalElements").value(1));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders/{id}/execution", orderId))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.outbox.status").value("DISPATCHED"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.status").value("COMPLETED"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.shipmentAttempts").value(1))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.activities[1].name").value("CreateOrderShipment"));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/app-config"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.demoEnabled").value(true));
+    }
+
+    @Test
+    void consoleReportsThreeActualShipmentAttempts() throws Exception {
+        orderId = "demo-retry-" + UUID.randomUUID();
+        startOrder();
+        assertEquals("SHIPMENT_CREATED", result());
+        console().perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders/{id}/execution", orderId))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.shipmentAttempts").value(3))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.activities[1].status").value("COMPLETED"));
+    }
+
+    @Test
+    void consoleReportsCompensationAndFailedWorkflowSeparately() throws Exception {
+        orderId = "demo-ambiguous-" + UUID.randomUUID();
+        startOrder();
+        assertThrows(WorkflowFailedException.class, this::result);
+        console().perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders/{id}/execution", orderId))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.status").value("FAILED"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.shipmentAttempts").value(3))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.activities[3].name").value("CompensateShipmentFailure"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.activities[3].status").value("COMPLETED"));
+        assertEquals("RELEASED", inventory.getReservation(orderId).status());
+    }
+
+    @Test
+    void consoleHandlesPendingMissingAndInvalidQueries() throws Exception {
+        orders.createOrder(orderId, sku, 2, "Console test address");
+        var mvc = console();
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders/{id}/execution", orderId))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.outbox.status").value("PENDING"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.workflow.status").value("NOT_FOUND"));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders/{id}/execution", "missing-order"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isNotFound());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders").param("size", "101"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/orders").param("page", "-1"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest());
+    }
+
+    @Test
+    void consoleReturnsEnglishValidationAndDuplicateErrors() throws Exception {
+        var mvc = console();
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/orders")
+                        .contentType("application/json").content("""
+                        {"orderId":"invalid input!","sku":"SKU-001","quantity":0,"shippingAddress":"Sydney"}
+                        """))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.detail").isNotEmpty());
+        orders.createOrder(orderId, sku, 2, "Console test address");
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/orders")
+                        .contentType("application/json").content("""
+                        {"orderId":"%s","sku":"%s","quantity":2,"shippingAddress":"Sydney"}
+                        """.formatted(orderId, sku)))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isConflict())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.detail").value("Order already exists: " + orderId));
     }
 
     private void startOrder() {
